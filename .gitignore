@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+part2/.env
+part1/secrets/*.tar
+part1/secrets/leaky-layers/
+part1/secrets/safe-layers/
