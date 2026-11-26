@@ -1,0 +1,178 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Lint Dockerfile with Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: part2/Dockerfile
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint Python code with Ruff
+        run: |
+          python -m pip install --upgrade pip ruff
+          ruff check part2/app
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run pytest
+        run: |
+          cd part2
+          python -m pip install -r requirements-dev.txt
+          pytest
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release version tag
+        id: meta
+        run: |
+          EXISTING_TAG=$(git tag --points-at HEAD --list 'v*' | head -n 1)
+          if [ -n "$EXISTING_TAG" ]; then
+            VERSION="$EXISTING_TAG"
+          else
+            COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y.%m.%d HEAD)
+            SHORT_SHA=$(git rev-parse --short=7 HEAD)
+            VERSION="v${COMMIT_DATE}-${SHORT_SHA}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION}"
+
+      - name: Build Docker image
+        run: |
+          docker build -t lab-queue:build ./part2
+          docker save -o lab-queue.tar lab-queue:build
+
+      - name: Upload built image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-queue-image
+          path: lab-queue.tar
+          retention-days: 1
+
+  push:
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lab-queue-image
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load, tag, and push image to GHCR
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/lab-queue"
+          docker load -i lab-queue.tar
+          docker tag lab-queue:build "${IMAGE_NAME}:${VERSION}"
+          docker tag lab-queue:build "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:${VERSION}"
+          docker push "${IMAGE_NAME}:latest"
+
+  pages:
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: "pages"
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inject release version into index.html
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          sed -i "s/__VERSION__/${VERSION}/g" part2/site/index.html
+          cat part2/site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: part2/site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  tag:
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push annotated Git tag
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if git rev-parse "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists; skipping."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${VERSION}" -m "Release ${VERSION} (commit ${GITHUB_SHA})"
+            git push origin "refs/tags/${VERSION}"
+          fi
