@@ -7,15 +7,14 @@ with a temporary directory, and do not start Docker.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterator
 
-try:
+if sys.platform != "win32":
     import fcntl
-except ImportError:  # Windows native pytest fallback; Linux containers use fcntl
-    fcntl = None  # type: ignore[assignment]
 
 
 def _validate_name(name: str) -> str:
@@ -33,12 +32,12 @@ def _queue_lock(queue_file: Path) -> Iterator[None]:
     queue_file.parent.mkdir(parents=True, exist_ok=True)
     lock_path = queue_file.parent / "queue.lock"
     with lock_path.open("a+", encoding="utf-8") as lock_file:
-        if fcntl is not None:
+        if sys.platform != "win32":
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
-            if fcntl is not None:
+            if sys.platform != "win32":
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
