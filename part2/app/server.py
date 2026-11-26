@@ -12,11 +12,29 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
-from app.queue import join, take
+from app.queue import join as file_join
+from app.queue import take as file_take
 
 
-def make_handler(queue_file: Path) -> type[BaseHTTPRequestHandler]:
+def _build_backend(data_dir: str) -> tuple[Callable[[str], int], Callable[[], str]]:
+    backend = os.environ.get("QUEUE_BACKEND", "file").lower()
+    if backend == "redis":
+        from app.redis_queue import RedisQueue
+
+        redis_url = os.environ.get("REDIS_URL", "redis://db:6379/0")
+        rq = RedisQueue(redis_url)
+        return rq.join, rq.take
+
+    queue_file = Path(data_dir) / "queue.txt"
+    return (lambda name: file_join(queue_file, name)), (lambda: file_take(queue_file))
+
+
+def make_handler(
+    join_fn: Callable[[str], int],
+    take_fn: Callable[[], str],
+) -> type[BaseHTTPRequestHandler]:
     class QueueHandler(BaseHTTPRequestHandler):
         def _send_text(self, status: int, text: str) -> None:
             body = text.encode("utf-8")
@@ -40,16 +58,22 @@ def make_handler(queue_file: Path) -> type[BaseHTTPRequestHandler]:
                     data = json.loads(raw.decode("utf-8"))
                     if not isinstance(data, dict) or "name" not in data:
                         raise ValueError("missing name")
-                    ticket = join(queue_file, data["name"])
+                    ticket = join_fn(data["name"])
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     self._send_text(400, "invalid")
+                    return
+                except Exception:
+                    self._send_text(503, "db unavailable")
                     return
                 self._send_text(200, str(ticket))
             elif self.path == "/next":
                 try:
-                    name = take(queue_file)
+                    name = take_fn()
                 except LookupError:
                     self._send_text(404, "empty")
+                    return
+                except Exception:
+                    self._send_text(503, "db unavailable")
                     return
                 self._send_text(200, name)
             else:
@@ -59,9 +83,9 @@ def make_handler(queue_file: Path) -> type[BaseHTTPRequestHandler]:
 
 
 def serve(host: str, port: int, data_dir: str) -> None:
-    """Listen until the process is stopped. Use join and take from app.queue."""
-    queue_file = Path(data_dir) / "queue.txt"
-    server = ThreadingHTTPServer((host, port), make_handler(queue_file))
+    """Listen until the process is stopped."""
+    join_fn, take_fn = _build_backend(data_dir)
+    server = ThreadingHTTPServer((host, port), make_handler(join_fn, take_fn))
     try:
         server.serve_forever()
     finally:
