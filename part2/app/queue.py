@@ -6,7 +6,16 @@ with a temporary directory, and do not start Docker.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
+
+try:
+    import fcntl
+except ImportError:  # Windows native pytest fallback; Linux containers use fcntl
+    fcntl = None  # type: ignore[assignment]
 
 
 def _validate_name(name: str) -> str:
@@ -18,29 +27,61 @@ def _validate_name(name: str) -> str:
     return cleaned
 
 
+@contextmanager
+def _queue_lock(queue_file: Path) -> Iterator[None]:
+    """Acquire an exclusive lock on a dedicated lock file in the same directory."""
+    queue_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = queue_file.parent / "queue.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write(target: Path, content: str) -> None:
+    """Write content to a unique temp file in the same dir and atomically replace target."""
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".queue-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(content)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+
+
 def join(path: str | Path, name: str) -> int:
     """Append one person and return the ticket number."""
     cleaned = _validate_name(name)
     file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing = file_path.read_text(encoding="utf-8").splitlines() if file_path.exists() else []
-    existing.append(cleaned)
-    file_path.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    return len(existing)
+    with _queue_lock(file_path):
+        existing = file_path.read_text(encoding="utf-8").splitlines() if file_path.exists() else []
+        existing.append(cleaned)
+        _atomic_write(file_path, "\n".join(existing) + "\n")
+        return len(existing)
 
 
 def take(path: str | Path) -> str:
     """Remove and return the first name."""
     file_path = Path(path)
-    if not file_path.exists():
-        raise LookupError("empty")
 
-    lines = file_path.read_text(encoding="utf-8").splitlines()
-    if not lines:
-        raise LookupError("empty")
+    with _queue_lock(file_path):
+        if not file_path.exists():
+            raise LookupError("empty")
 
-    first, rest = lines[0], lines[1:]
-    content = ("\n".join(rest) + "\n") if rest else ""
-    file_path.write_text(content, encoding="utf-8")
-    return first
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            raise LookupError("empty")
+
+        first, rest = lines[0], lines[1:]
+        content = ("\n".join(rest) + "\n") if rest else ""
+        _atomic_write(file_path, content)
+        return first
